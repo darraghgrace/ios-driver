@@ -18,7 +18,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import org.openqa.selenium.SessionNotCreatedException;
 import org.openqa.selenium.WebDriverException;
-import org.openqa.selenium.remote.BeanToJsonConverter;
+import org.uiautomation.ios.utils.BeanToJsonConverter;
 import org.openqa.selenium.remote.ErrorCodes;
 import org.openqa.selenium.remote.Response;
 import org.uiautomation.ios.CommandMapping;
