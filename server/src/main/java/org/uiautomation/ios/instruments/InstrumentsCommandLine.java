@@ -14,6 +14,20 @@
 
 package org.uiautomation.ios.instruments;
 
+import static org.uiautomation.ios.instruments.commandExecutor.CommunicationMode.CURL;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 import org.openqa.selenium.WebDriverException;
 import org.openqa.selenium.remote.Response;
 import org.uiautomation.ios.Device;
@@ -30,14 +44,6 @@ import org.uiautomation.ios.utils.AppleMagicString;
 import org.uiautomation.ios.utils.ClassicCommands;
 import org.uiautomation.ios.utils.Command;
 import org.uiautomation.ios.utils.CommandOutputListener;
-
-import java.io.File;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.logging.Logger;
-
-import static org.uiautomation.ios.instruments.commandExecutor.CommunicationMode.CURL;
 
 public class InstrumentsCommandLine implements Instruments {
 
@@ -93,32 +99,13 @@ public class InstrumentsCommandLine implements Instruments {
 
 
   @Override
-  public void start(long timeout) throws InstrumentsFailedToStartException {
+  public void start(long timeout) throws InstrumentsFailedToStartException, ApplicationCrashedOnStartException {
     boolean success = false;
     try {
+
+      // Remove stale iphonesimulator launchd instances
+      removeStaleSimulatorLaunchds();
       instruments.start();
-
-      if (version.getMajor() >= 6 && caps.getReuseContentAndSettings()) {
-        // If we launch instruments w/o clearing the content and settings folder in xcode 6, the 1st launch just
-        // launches the simulator but fails to launch the app with the following error
-        //    "Instruments Trace Error : Target failed to run: The operation couldn’t be completed.
-        //    (FBSOpenApplicationErrorDomain error 8.) : Failed to launch process with bundle identifier
-        //    '<bundle name>'"
-        // So we need to launch instruments twice.
-
-        long startTime = System.currentTimeMillis();
-        instruments.waitFor(10000);
-        long endTime = System.currentTimeMillis();
-        if (endTime - startTime >= 10000) {
-          throw new WebDriverException("Wait for instruments timed out. It probably means Apple has fixed this issue "
-              + "and we can just get rid of the parent if block.");
-        }
-        instruments.start();
-
-        // Another alternate way would be to run
-        //       xcrun simctl launch <uuid> <bundle name> [<args>]
-        // We will also have to update the instruments js to respond back after the app comes to foreground
-      }
 
       // for the no delay instruments, the command launches a script that in turn launches instruments.
       // need to keep the pid of intruments itself to be able to kill it.
@@ -136,8 +123,14 @@ public class InstrumentsCommandLine implements Instruments {
       log.fine("registration request received" + session.getCachedCapabilityResponse());
       if (!success) {
         log.warning("instruments crashed (" + ((System.currentTimeMillis() - waitStartTime) / 1000) + " sec)".toUpperCase());
-        throw new InstrumentsFailedToStartException(
-            "Didn't get the capability back.Most likely, instruments crashed at startup.");
+        int exitStatus = instruments.waitFor((int)timeout*1000);
+        if (exitStatus == 0) {
+          //instruments successfully completed, which means the app terminated rather than instruments crashing.
+          throw new ApplicationCrashedOnStartException("Instruments did not start a session because the application crashed.");
+        } else {
+          throw new InstrumentsFailedToStartException(
+                  "Didn't get the capability back.Most likely, instruments crashed at startup.");
+        }
       }
     } catch (InterruptedException e) {
       throw new InstrumentsFailedToStartException("instruments was interrupted while starting.");
@@ -275,5 +268,90 @@ public class InstrumentsCommandLine implements Instruments {
     return output;
   }
 
+  /**
+   * Removes stale iphonesimulator launchds hanging in the system
+   */
+  public void removeStaleSimulatorLaunchds() {
+
+    // The instruments crashes sometimes by throwing the following error in the logs
+    // The below logs were taken from Xcode5.1.1
+    // sim[2430:303] Multiple instances of launchd_sim detected, using com.apple.iphonesimulator.launchd.3bd855a 
+    // instead of com.apple.iphonesimulator.launchd.59ef76ee.
+    List<String> launchctlCmd = Arrays.asList("launchctl", "list");
+    Command cmd = new Command(launchctlCmd, false);
+    SimulatorLaunchd simLaunchd = new SimulatorLaunchd();
+    cmd.registerListener(simLaunchd);
+    cmd.executeAndWait(true);
+
+    // Retrieve the stale iphonesimulator launch IDs
+    Set<String> simIDs = simLaunchd.getLaunchdIDs();
+    if (simIDs.size() > 0) {
+      if (log.isLoggable(Level.FINE)) {
+        log.log(Level.FINE, "Removing stale iphonesimulator launchds: " + simIDs);
+      }
+      String iphoneSimulatorPrefix = "com.apple.iphonesimulator.launchd.";
+      for (String id : simIDs) {
+        launchctlCmd = Arrays.asList("launchctl", "remove", iphoneSimulatorPrefix + id);
+        cmd = new Command(launchctlCmd, false);
+        cmd.executeAndWait(true);
+      }
+    }
+  }
+
+
+  /**
+   * Captures stale iphonesimulator launchd IDs. The command listener returns the 
+   * launchd IDs of stale iphonesimulators. This emulates the behaviour of the
+   * command 'launchctl list | grep com.apple.iphonesimulator'.
+   */
+  private static class SimulatorLaunchd implements CommandOutputListener {
+
+    // Pattern to search launchctl for com.apple.iphonesimulator.launchd.<some_id>
+    private Pattern pattern = null;
+
+    // Set holding the simulator launchd IDs
+    private Set<String> launchdIDs = new HashSet<String>();
+
+    // Logger instance
+    private static final Logger logger = Logger.getLogger(SimulatorLaunchd.class.getName());
+
+    SimulatorLaunchd() {
+
+      // Captures stale iphonesimulators launchds i.e.,
+      // [123 - com.apple.iphonesimulator.launchd.6d6b02fa] represents a live iphonesimulator launchd
+      // [- 0 com.apple.iphonesimulator.launchd.6d6b02fa] represents a stale iphonesimulator launchd
+      pattern = Pattern.compile("(-)\\s+(-*\\d+)\\s+com.apple.iphonesimulator.launchd.(\\w+)");
+      launchdIDs = new HashSet<String>();
+    }
+
+    @Override
+    public void stdout(String log) {
+      Matcher matcher = pattern.matcher(log);
+      if (matcher.matches()) {
+        if (!"0".equals(matcher.group(2))) {
+          logger.warning("invalid exit code for iphonesimulator launchd " + matcher.group(0));
+        }
+        launchdIDs.add(matcher.group(3));
+      }
+    }
+
+    @Override
+    public void stderr(String log) {
+      Matcher matcher = pattern.matcher(log);
+      if (matcher.matches()) {
+        logger.warning("CommandOutputListener receiving logs in stderr, 'com.apple.iphonesimulator.launchd' will skip cleaning: " + matcher.group(0));
+      }
+    }
+
+    /**
+     * Returns a {@link Set} of stale iphonesimulator IDs
+     * 
+     * @return Set of stale iphonesimulator IDs
+     */
+    public Set<String> getLaunchdIDs() {
+      return launchdIDs;
+    }
+
+  }
 
 }

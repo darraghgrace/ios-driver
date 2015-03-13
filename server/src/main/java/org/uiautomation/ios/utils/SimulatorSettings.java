@@ -106,6 +106,35 @@ public class SimulatorSettings {
     }
   }
 
+  /**
+   * Set the Accessibility preferences. Overrides the values in 'com.apple.Accessibility.plist' file.
+   */
+  public void setAccessibilityOptions() {
+    
+    // Not enabling ApplicationAccessibility may cause intruments to fail with the error 
+    // ScriptAgent[1170:2f07] Failed to enable accessiblity, kAXErrorServerNotFound
+    // The above error is more prominent in Xcode5.1.1 when tested under OSX 10.9.5
+    // Setting ApplicationAccessibilityEnabled for Xcode6.0
+    File folder = new File(contentAndSettingsFolder + "/Library/Preferences/");
+    File preferenceFile = new File(folder, "com.apple.Accessibility.plist");
+    try {
+      JSONObject preferences = new JSONObject();
+      if (instrumentsVersion.getMajor() < 6) {
+        
+        // ex: <key>ApplicationAccessibilityEnabled</key><true/>
+        preferences.put("ApplicationAccessibilityEnabled", true);
+      } else {
+        
+        // Xcode6.0 has integer datatype for ApplicationAccessibilityEnabled
+        // ex: <key>ApplicationAccessibilityEnabled</key><integer>1</integer>
+        preferences.put("ApplicationAccessibilityEnabled", 1);
+      }
+      writeOnDisk(preferences, preferenceFile);
+    } catch (Exception e) {
+      throw new WebDriverException("cannot set options in " + preferenceFile.getAbsolutePath(), e);
+    }
+  }
+
   public void setMobileSafariOptions() {
     File preferenceFile = getMobileSafariPreferencesFile();
     try {
@@ -218,41 +247,67 @@ public class SimulatorSettings {
           System.err.println("cannot delete content and settings folder " + contentAndSettingsFolder);
         }
       }
+
+      // Wipe the system.log.
+      String deviceLogDir = System.getProperty("user.home") +
+          "/Library/Logs/iOS Simulator/" + exactSdkVersion + ((is64bit) ? "-64" : "");
+      File deviceLog = new File(deviceLogDir, "system.log");
+      if (deviceLog.exists()) {
+        deviceLog.delete();
+      }
+
       boolean ok = contentAndSettingsFolder.mkdirs();
       if (!ok) {
         System.err.println("couldn't re-create: " + contentAndSettingsFolder);
       }
     } else {
       // Starting with Xcode 6 and later, we can use simctl to do the hard work for us.
-      List<String> simctlArgs = new ArrayList<>();
-      simctlArgs.add("xcrun");
-      simctlArgs.add("simctl");
-      simctlArgs.add("erase");
-      simctlArgs.add(deviceUUID);
-      Command simctlCmd = new Command(simctlArgs, true);
-      
-      // if the device is still in booted state erase returns with error code 146
-      int exitCode = simctlCmd.executeAndWait(true);
-      if (exitCode == 146) {
-        log.log(Level.WARNING, "Reset content and settings exit code = " + exitCode
-            + ", possibly device is in booted state, shutdown device = " + deviceUUID);
+      // If it fails, we have to turn the device off first.
+      if (!eraseSimulator()) {
+        log.log(Level.WARNING, "Reset content and settings failed, " +
+            "possibly device is in booted state, shutdown device = " + deviceUUID);
+        List<String> simctlArgs = new ArrayList<>();
         simctlArgs = Arrays.asList("xcrun", "simctl", "shutdown", deviceUUID);
-        simctlCmd = new Command(simctlArgs, true);
+        Command simctlCmd = new Command(simctlArgs, true);
 
-        // Handle errors thrown by command 'xcrun simctl shutdown <uuid>'
-        // and kill any open iOS simulator windows
-        exitCode = simctlCmd.executeAndWait(false);
-        ClassicCommands.killall("iOS Simulator");
+        // Run command 'xcrun simctl shutdown <uuid>'
+        simctlCmd.executeAndWait(false);
 
-        // Retry 'xcrun simctl erase <uuid>'
-        simctlArgs = Arrays.asList("xcrun", "simctl", "erase", deviceUUID);
-        simctlCmd = new Command(simctlArgs, true);
-        exitCode = simctlCmd.executeAndWait(false);
-      } else if (exitCode != 0) {
-        throw new WebDriverException("execution failed. Exit code =" + exitCode + " , command was: "
-            + simctlCmd.commandString());
+        // Retry
+        eraseSimulator();
       }
     }
+  }
+
+  private boolean eraseSimulator() {
+    assert instrumentsVersion.getMajor() >= 6;
+
+    // Starting with Xcode 6 and later, we can use simctl to do the hard work for us.
+    List<String> simctlArgs = new ArrayList<>();
+    simctlArgs.add("xcrun");
+    simctlArgs.add("simctl");
+    simctlArgs.add("erase");
+    simctlArgs.add(deviceUUID);
+    Command simctlCmd = new Command(simctlArgs, true);
+
+    // if the device is still in booted state erase returns with error code 146
+    int exitCode = simctlCmd.executeAndWait(true);
+    if (exitCode == 146) {
+      return false;
+    } else if (exitCode != 0) {
+      throw new WebDriverException("execution failed. Exit code =" + exitCode + " , command was: "
+        + simctlCmd.commandString());
+    }
+
+    // Wipe the system.log, since simctl doesn't do it.
+    String deviceLogDir = System.getProperty("user.home") +
+      "/Library/Logs/CoreSimulator/" + deviceUUID;
+    File deviceLog = new File(deviceLogDir, "system.log");
+    if (deviceLog.exists()) {
+      deviceLog.delete();
+    }
+
+    return true;
   }
 
   public void writeContentFile(String path, byte[] fileContents) {

@@ -14,18 +14,32 @@
 
 package org.uiautomation.ios.application;
 
-import com.google.common.collect.ImmutableList;
+import static org.uiautomation.ios.IOSCapabilities.BUNDLE_ICONS;
+import static org.uiautomation.ios.IOSCapabilities.DEVICE_FAMILLY;
+import static org.uiautomation.ios.IOSCapabilities.ICON;
+import static org.uiautomation.ios.IOSCapabilities.MAGIC_PREFIX;
 
-import com.dd.plist.BinaryPropertyListWriter;
-import com.dd.plist.NSArray;
-import com.dd.plist.NSDictionary;
-import com.dd.plist.NSNumber;
-import com.dd.plist.NSObject;
-import com.dd.plist.PropertyListParser;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FilenameFilter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.openqa.grid.common.RegistrationRequest;
 import org.openqa.selenium.SessionNotCreatedException;
 import org.openqa.selenium.WebDriverException;
 import org.uiautomation.ios.IOSCapabilities;
@@ -33,23 +47,13 @@ import org.uiautomation.ios.communication.device.DeviceType;
 import org.uiautomation.ios.utils.IOSVersion;
 import org.uiautomation.ios.utils.PlistFileUtils;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FilenameFilter;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.logging.Logger;
-
-import static org.uiautomation.ios.IOSCapabilities.BUNDLE_ICONS;
-import static org.uiautomation.ios.IOSCapabilities.DEVICE_FAMILLY;
-import static org.uiautomation.ios.IOSCapabilities.ICON;
-import static org.uiautomation.ios.IOSCapabilities.MAGIC_PREFIX;
+import com.dd.plist.BinaryPropertyListWriter;
+import com.dd.plist.NSArray;
+import com.dd.plist.NSDictionary;
+import com.dd.plist.NSNumber;
+import com.dd.plist.NSObject;
+import com.dd.plist.PropertyListParser;
+import com.google.common.collect.ImmutableList;
 
 public class APPIOSApplication {
 
@@ -59,6 +63,12 @@ public class APPIOSApplication {
   private final File app;
   private final ImmutableList<LanguageDictionary> dictionaries;
   private final ImmutableList<AppleLanguage> languages;
+
+  // Pattern to match '7.1' in the text '/Users/unclejohn/.ios-driver/safariCopies/safari-7.1.app'
+  // or '8.1' in the text
+  // '/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator8.1.sdk/Applications/MobileSafari.app'
+  private static final Pattern SAFARI_SDK_VERSION = Pattern
+      .compile("\\S+safari-([\\d\\.]+)\\.app|\\S+iPhoneSimulator([\\d\\.]+).sdk\\S+/MobileSafari.app");
 
   /**
    * @param pathToApp
@@ -180,7 +190,7 @@ public class APPIOSApplication {
       } catch (Exception e) {
         log.warning(
           "Error loading content for l10n for file: " + f.getAbsolutePath() + ", exception: " + e.getMessage() + "\n" +
-          e.getStackTrace());
+          Arrays.asList(e.getStackTrace()));
       }
     }
     List<LanguageDictionary> dicts = new ArrayList<>(languageNameMap.values());
@@ -477,16 +487,30 @@ public class APPIOSApplication {
         throw new WebDriverException("cannot get metadata", e);
       }
     }
+
+    // Set 'browserName' to the string retrieved by 'CFBundleName' for native apps.
+    // 'CFBundleName' does not seem to return values for Safari app so setting
+    // 'browserName' to 'CFBundleDisplayName', converted to lower case as the
+    // icons in the Selenium grid are mapped to lower case.
+    String bundleName = metadata.optString(IOSCapabilities.BUNDLE_NAME);
+    String bundleDisplayName = metadata.optString(IOSCapabilities.BUNDLE_DISPLAY_NAME);
+    if (bundleName != null && bundleName.trim().length() > 0) {
+      cap.setBrowserName(bundleName.trim());
+    } else if (bundleDisplayName != null && bundleDisplayName.trim().length() > 0) {
+      cap.setBrowserName(bundleDisplayName.trim().toLowerCase());
+    } else {
+      log.log(Level.WARNING, "Empty string received for 'CFBundleName' / 'CFBundleDisplayName' meta data for app "
+          + this.app.getAbsolutePath());
+    }
+
+    // Fixes the below warning during Selenium grid registration
+    // org.openqa.grid.internal.BaseRemoteProxy <init>
+    // WARNING: Max instance not specified. Using default = 1 instance
+    cap.setCapability(RegistrationRequest.MAX_INSTANCES, "1");
     return cap;
   }
 
   public static boolean canRun(IOSCapabilities desiredCapabilities, IOSCapabilities appCapability) {
-
-    // check if the app can run the requested SDK
-    String sdk = desiredCapabilities.getSDKVersion();
-    if (sdk != null) {
-      List<String> supported = (List<String>) appCapability.getCapability(IOSCapabilities.UI_SDK_VERSION_ALT);
-    }
 
     if (desiredCapabilities.getCapability(IOSCapabilities.SIMULATOR) != null &&
         desiredCapabilities.isSimulator() != appCapability.isSimulator()) {
@@ -586,6 +610,32 @@ public class APPIOSApplication {
       return new APPIOSApplication(app.getAbsolutePath());
     } else {
       return null;
+    }
+  }
+
+  /**
+   * Returns the Safari SDK version from the location of the application, will throw {@link WebDriverException} if
+   * called on a Non Safari application.
+   * 
+   * @return Safari SDK version
+   */
+  public String getSafariSDKVersion() {
+    validateSafariSDKVersionMethodCall();
+    Matcher sdkVersionMatcher = SAFARI_SDK_VERSION.matcher(app.getAbsolutePath());
+    if (sdkVersionMatcher.matches()) {
+      return sdkVersionMatcher.group(1) != null ? sdkVersionMatcher.group(1) : sdkVersionMatcher.group(2);
+    } else {
+      throw new WebDriverException("Cannot identify the version of Safari from application: " + app.getAbsolutePath());
+    }
+  }
+
+  private void validateSafariSDKVersionMethodCall() {
+    if (!isSafari()) {
+      throw new UnsupportedOperationException("SDK version cannot be determined for non-safari app");
+    }
+    if (!app.exists()) {
+      throw new WebDriverException("Application: " + app.getAbsolutePath()
+          + " does not exist in the specified location");
     }
   }
 }

@@ -60,7 +60,7 @@ public class RemoteIOSWebDriver {
   private final ServerSideSession session;
   private final String connectionKey;
   private BaseWebInspector currentInspector;
-  private Map<Integer, BaseWebInspector> inspectors = new HashMap<>();
+  private final Map<Integer, BaseWebInspector> inspectors = new HashMap<>();
   private static final Logger log = Logger.getLogger(RemoteIOSWebDriver.class.getName());
   private List<WebkitPage> pages = new ArrayList<>();
   private final WebKitSynchronizer sync;
@@ -109,12 +109,19 @@ public class RemoteIOSWebDriver {
 
     if (applications.size() == 1) {
       connect(applications.get(0).getBundleId());
-    } else if (applications.size() == 2) {
-      connect(applications.get(1).getBundleId());
+      isStarted = true;
     } else {
+      for (int index = 0; index < applications.size(); index++) {
+        if (!applications.get(index).getApplicationName().equalsIgnoreCase("Safari")) {
+          connect(applications.get(index).getBundleId());
+          isStarted = true;
+          break;
+        }
+      }
+    }
+    if (!isStarted) {
       showWarning();
     }
-    isStarted = true;
 
   }
 
@@ -181,10 +188,14 @@ public class RemoteIOSWebDriver {
         protocol.connect(bundleId);
         sync.waitForSimToSendPages();
         log.fine("bundleId=" + bundleId);
-        switchTo(Collections.max(getPages()));
-        if (getPages().size() > 1) {
-          log.warning("Application started, but already have " + getPages().size()
-                      + " webviews. Connecting to the one with highest page id.");
+        if (getPages() != null && getPages().size() > 0) {
+          switchTo(Collections.max(getPages()));
+          if (getPages().size() > 1) {
+            log.warning("Application started, but already have " + getPages().size()
+                + " webviews. Connecting to the one with highest page id.");
+          }
+        } else {
+            log.warning("Application started, but doesn't have any page.");
         }
         return;
       }
